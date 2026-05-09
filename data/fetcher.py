@@ -1,13 +1,63 @@
 """
 data/fetcher.py
 A股实时行情、历史K线、北向资金数据获取模块
-依赖：akshare, pandas
+依赖：akshare, pandas；可选：tushare, baostock
+
+支持多数据源切换，默认使用 AKShare（无需配置）。
+切换示例：
+    from data.fetcher import set_data_source
+    set_data_source("tushare", {"token": "your_token"})
+    set_data_source("baostock")
+    set_data_source("akshare")   # 切回默认
 """
 
-import akshare as ak
-import pandas as pd
-from datetime import datetime, timedelta
+import sys
+import os
 
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# 数据源管理
+# ---------------------------------------------------------------------------
+
+_SOURCE: str = "akshare"
+_SOURCE_CONFIG: dict = {}
+
+
+def set_data_source(source: str, config: dict = None) -> None:
+    """
+    切换全局数据源。
+
+    参数：
+        source - 数据源名称，支持 "akshare"（默认）、"tushare"、"baostock"
+        config - 数据源配置字典，例如 Tushare 需要 {"token": "xxx"}
+    """
+    global _SOURCE, _SOURCE_CONFIG
+    _SOURCE = source
+    _SOURCE_CONFIG = config or {}
+    print(f"[fetcher] 数据源已切换为: {_SOURCE}")
+
+
+def _get_source_module():
+    """根据当前 _SOURCE 动态加载对应的数据源模块。"""
+    if _SOURCE == "tushare":
+        from data.sources import tushare_source
+        return tushare_source
+    elif _SOURCE == "baostock":
+        from data.sources import baostock_source
+        return baostock_source
+    else:
+        from data.sources import akshare_source
+        return akshare_source
+
+
+# ---------------------------------------------------------------------------
+# 公共接口（委托至数据源模块）
+# ---------------------------------------------------------------------------
 
 def get_all_a_stock_realtime() -> pd.DataFrame:
     """
@@ -25,119 +75,33 @@ def get_all_a_stock_realtime() -> pd.DataFrame:
         amount        - 成交额(元)
 
     网络失败时返回空 DataFrame 并打印错误。
+    当前数据源由 set_data_source() 控制，默认为 akshare。
     """
-    try:
-        # 使用东方财富A股实时行情接口，字段最全
-        df = ak.stock_zh_a_spot_em()
-        # 原始列名参考：序号,代码,名称,最新价,涨跌幅,涨跌额,成交量,成交额,振幅,
-        # 最高,最低,今开,昨收,量比,换手率,市盈率-动态,市净率,总市值,流通市值,...
-        rename_map = {
-            "代码": "code",
-            "名称": "name",
-            "最新价": "price",
-            "涨跌幅": "pct_change",
-            "成交量": "volume",
-            "成交额": "amount",
-            "市盈率-动态": "pe",
-            "市净率": "pb",
-            "总市值": "total_mv",
-            "流通市值": "float_mv",
-            "换手率": "turnover_rate",
-            "量比": "volume_ratio",
-        }
-        df = df.rename(columns=rename_map)
-
-        # 只保留需要的列（容错：列不存在则跳过）
-        keep_cols = [c for c in rename_map.values() if c in df.columns]
-        df = df[keep_cols].copy()
-
-        # 类型转换
-        numeric_cols = ["price", "pct_change", "pe", "pb", "volume",
-                        "amount", "turnover_rate", "volume_ratio"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 总市值转换为亿元（原始单位为元）
-        if "total_mv" in df.columns:
-            df["total_mv"] = pd.to_numeric(df["total_mv"], errors="coerce") / 1e8
-        if "float_mv" in df.columns:
-            df["float_mv"] = pd.to_numeric(df["float_mv"], errors="coerce") / 1e8
-
-        # 剔除停牌（价格为0或NaN）
-        df = df[df["price"].notna() & (df["price"] > 0)].reset_index(drop=True)
-
-        print(f"[fetcher] 实时行情获取成功，共 {len(df)} 条记录")
-        return df
-
-    except Exception as e:
-        print(f"[fetcher] get_all_a_stock_realtime 失败: {e}")
-        return pd.DataFrame()
+    return _get_source_module().get_all_a_stock_realtime(_SOURCE_CONFIG)
 
 
 def get_stock_history(code: str, days: int = 120) -> pd.DataFrame:
     """
-    获取指定股票的日线历史K线数据（用于技术指标计算）。
+    获取指定股票的日线历史K线数据（前复权，用于技术指标计算）。
 
     参数：
         code  - 股票代码（6位纯数字字符串，如 "000001"）
         days  - 获取最近N个交易日的数据，默认120天（够算MA60+缓冲）
 
     返回 DataFrame 列：
-        date     - 日期 (datetime)
-        open     - 开盘价
-        high     - 最高价
-        low      - 最低价
-        close    - 收盘价
-        volume   - 成交量(手)
-        amount   - 成交额(元)
-        pct_change - 涨跌幅(%)
+        date(datetime), open, high, low, close, volume, amount, pct_change
+    按日期升序排列。
 
     网络失败时返回空 DataFrame 并打印错误。
+    当前数据源由 set_data_source() 控制，默认为 akshare。
+    AKShare 失败时自动回退至 Baostock。
     """
-    try:
-        end_date = datetime.today().strftime("%Y%m%d")
-        start_date = (datetime.today() - timedelta(days=days * 2)).strftime("%Y%m%d")
-
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",   # 前复权，技术分析标准做法
-        )
-
-        rename_map = {
-            "日期": "date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume",
-            "成交额": "amount",
-            "涨跌幅": "pct_change",
-        }
-        df = df.rename(columns=rename_map)
-
-        keep_cols = [c for c in rename_map.values() if c in df.columns]
-        df = df[keep_cols].copy()
-
-        df["date"] = pd.to_datetime(df["date"])
-        numeric_cols = ["open", "high", "low", "close", "volume", "amount", "pct_change"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.sort_values("date").reset_index(drop=True)
-
-        # 只保留最近 days 个交易日
-        df = df.tail(days).reset_index(drop=True)
-
-        return df
-
-    except Exception as e:
-        print(f"[fetcher] get_stock_history({code}) 失败: {e}")
-        return pd.DataFrame()
+    result = _get_source_module().get_stock_history(code, days, _SOURCE_CONFIG)
+    if result.empty and _SOURCE == "akshare":
+        print(f"[fetcher] AKShare 获取 {code} 失败，自动回退至 Baostock…")
+        from data.sources import baostock_source
+        result = baostock_source.get_stock_history(code, days, {})
+    return result
 
 
 def get_northbound_flow() -> pd.DataFrame:
@@ -145,43 +109,14 @@ def get_northbound_flow() -> pd.DataFrame:
     获取北向资金（沪深港通北向）净流入数据。
 
     返回 DataFrame 列：
-        date              - 日期 (datetime)
-        sh_net_inflow     - 沪股通净流入(亿元)
-        sz_net_inflow     - 深股通净流入(亿元)
-        total_net_inflow  - 合计净流入(亿元)
+        date(datetime), sh_net_inflow, sz_net_inflow, total_net_inflow
+    单位：亿元
 
     网络失败时返回空 DataFrame 并打印错误。
+    当前数据源由 set_data_source() 控制，默认为 akshare。
+    注意：tushare 数据源仅提供合计北向资金，sh/sz 拆分为 NaN。
     """
-    try:
-        # 北向资金每日流向汇总
-        df = ak.stock_em_hsgt_north_net_flow_in(symbol="沪深港通")
-
-        rename_map = {
-            "日期": "date",
-            "沪股通": "sh_net_inflow",
-            "深股通": "sz_net_inflow",
-            "北向资金": "total_net_inflow",
-        }
-        df = df.rename(columns=rename_map)
-
-        keep_cols = [c for c in rename_map.values() if c in df.columns]
-        df = df[keep_cols].copy()
-
-        df["date"] = pd.to_datetime(df["date"])
-
-        numeric_cols = ["sh_net_inflow", "sz_net_inflow", "total_net_inflow"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce") / 1e8  # 转亿元
-
-        df = df.sort_values("date").reset_index(drop=True)
-
-        print(f"[fetcher] 北向资金数据获取成功，共 {len(df)} 条记录")
-        return df
-
-    except Exception as e:
-        print(f"[fetcher] get_northbound_flow 失败: {e}")
-        return pd.DataFrame()
+    return _get_source_module().get_northbound_flow(_SOURCE_CONFIG)
 
 
 def get_northbound_holdings() -> pd.DataFrame:
@@ -189,53 +124,13 @@ def get_northbound_holdings() -> pd.DataFrame:
     获取北向资金（沪深港通）个股持股数据（最新一期）。
 
     返回 DataFrame 列：
-        code           - 股票代码
-        name           - 股票名称
-        hold_shares    - 持股数量(股)
-        hold_ratio     - 持股比例(%)
-        hold_change    - 持股变动(股)
-        market         - 市场(沪/深)
+        code, name, hold_shares, hold_ratio, hold_change, market
 
     网络失败时返回空 DataFrame 并打印错误。
+    当前数据源由 set_data_source() 控制，默认为 akshare。
+    注意：tushare 数据源需要高级积分权限，将返回空 DataFrame。
     """
-    try:
-        frames = []
-        for market in ["沪股通", "深股通"]:
-            try:
-                df_m = ak.stock_em_hsgt_hold_stock(market=market)
-                df_m["market"] = market
-                frames.append(df_m)
-            except Exception as e:
-                print(f"[fetcher] 获取{market}持股数据失败: {e}")
-
-        if not frames:
-            return pd.DataFrame()
-
-        df = pd.concat(frames, ignore_index=True)
-
-        rename_map = {
-            "股票代码": "code",
-            "股票名称": "name",
-            "持股数量": "hold_shares",
-            "持股占比": "hold_ratio",
-            "持股变动": "hold_change",
-        }
-        df = df.rename(columns=rename_map)
-
-        keep_cols = [c for c in rename_map.values() if c in df.columns] + ["market"]
-        keep_cols = [c for c in keep_cols if c in df.columns]
-        df = df[keep_cols].copy()
-
-        for col in ["hold_shares", "hold_ratio", "hold_change"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        print(f"[fetcher] 北向持股数据获取成功，共 {len(df)} 条记录")
-        return df
-
-    except Exception as e:
-        print(f"[fetcher] get_northbound_holdings 失败: {e}")
-        return pd.DataFrame()
+    return _get_source_module().get_northbound_holdings(_SOURCE_CONFIG)
 
 
 if __name__ == "__main__":

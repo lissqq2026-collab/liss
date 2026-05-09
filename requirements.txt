@@ -2,3 +2,6 @@ akshare
 pandas
 numpy
 streamlit
+tushare
+baostock
+plotly
