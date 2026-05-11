@@ -110,6 +110,11 @@ def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True,
         margin=dict(l=60, r=20, t=60, b=20),
         hovermode="x unified",
         dragmode="pan",
+        newshape=dict(
+            line=dict(color="#FF6600", width=2),
+            opacity=0.8,
+            drawdirection="any",
+        ),
         spikedistance=-1,
         hoverdistance=-1,
     )

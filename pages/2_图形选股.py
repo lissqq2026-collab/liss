@@ -275,5 +275,6 @@ if selected_label:
         st.plotly_chart(fig, use_container_width=True, config={
             "scrollZoom": True,
             "displayModeBar": True,
+            "modeBarButtonsToAdd": ["drawline", "eraseshape"],
             "modeBarButtonsToRemove": ["select2d", "lasso2d"],
         })

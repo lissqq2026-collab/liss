@@ -136,6 +136,47 @@ with st.sidebar:
 
     run_btn = st.button("开始筛选", type="primary", use_container_width=True)
 
+    st.markdown("---")
+    with st.expander("批量下载全市场数据"):
+        st.caption("将全市场A股历史数据下载到本地数据库（约5000只，耗时较长）")
+        st.warning("全市场下载约需30-60分钟，请保持网络连接")
+        bulk_btn = st.button("开始批量下载", use_container_width=True, key="bulk_dl")
+        if bulk_btn:
+            import datetime as _dt_bulk
+            from data.fetcher import get_all_a_stock_realtime, get_stock_history
+            from data.db import manager as _db_bulk
+            st.info("正在获取全市场股票列表…")
+            df_bulk_all = get_all_a_stock_realtime()
+            if df_bulk_all.empty:
+                st.error("获取股票列表失败，请检查网络后重试。")
+            else:
+                _codes_all = df_bulk_all["code"].tolist()
+                _names_map = dict(zip(df_bulk_all["code"], df_bulk_all.get("name", df_bulk_all["code"])))
+                _total = len(_codes_all)
+                st.info(f"共获取到 {_total} 只股票，开始逐个下载…")
+                _pbulk = st.progress(0)
+                _stxt = st.empty()
+                _errs = 0
+                for _i, _c in enumerate(_codes_all):
+                    _stxt.text(f"[{_i+1}/{_total}] 正在下载：{_c} {_names_map.get(_c, '')}")
+                    try:
+                        _today = _dt_bulk.date.today().isoformat()
+                        _meta = _db_bulk.get_meta(_c)
+                        if _meta is None or _meta.get("last_date") != _today:
+                            _days = 3700 if _meta is None else 90
+                            _dfh = get_stock_history(_c, days=_days)
+                            if not _dfh.empty:
+                                _nc = str(_dfh["name"].iloc[-1]) if "name" in _dfh.columns else _names_map.get(_c, _c)
+                                _ld = _dfh["date"].max()
+                                _lds = _ld.strftime("%Y-%m-%d") if hasattr(_ld, "strftime") else str(_ld)[:10]
+                                _db_bulk.upsert_daily(_c, _dfh)
+                                _db_bulk.upsert_meta(_c, _nc, _lds)
+                    except Exception:
+                        _errs += 1
+                    _pbulk.progress((_i + 1) / _total)
+                _stxt.text(f"批量下载完成！成功 {_total - _errs} 只，失败 {_errs} 只。")
+                st.success("批量下载完毕，可在图形选股中使用本地数据。")
+
 # ── 主区域 ───────────────────────────────────────────────────────────────────
 
 st.title("A 股选股工具")
@@ -304,3 +345,98 @@ with tab3:
     else:
         st.caption(f"共 {len(df_capital)} 只（北向连续净流入 ≥ {min_consecutive_days} 天）")
         st.dataframe(df_capital, use_container_width=True)
+
+# ── K线查看 ───────────────────────────────────────────────────────────────────
+
+import datetime as _dt_kl
+from data.db import manager as _db_kl
+from data.fetcher import get_stock_history as _get_hist
+from strategies.chart import build_kline_chart as _build_kl
+from strategies.chart import resample_weekly as _resample_w
+from strategies.chart import resample_monthly as _resample_m
+
+st.divider()
+st.markdown("### 📈 查看K线")
+
+_kl_opts = ["手动输入代码"]
+if not df_stage2.empty:
+    _nc = "name" if "name" in df_stage2.columns else None
+    for _, _r in df_stage2.iterrows():
+        _kl_opts.append(f"{_r['code']}  {_r[_nc]}" if _nc else _r["code"])
+
+_kc1, _kc2, _kc3 = st.columns([4, 1, 2])
+with _kc1:
+    _kl_sel = st.selectbox("选择股票", _kl_opts, key="kl_sel")
+with _kc2:
+    _kl_period = st.selectbox("周期", ["日K", "周K", "月K"], key="kl_period")
+with _kc3:
+    _kl_range = st.selectbox("时间范围", ["近3月", "近6月", "近1年", "近3年", "全部"], index=2, key="kl_range")
+
+_kl_macd = st.checkbox("显示MACD", value=True, key="kl_macd")
+
+if _kl_sel == "手动输入代码":
+    _kl_code = st.text_input("输入6位股票代码", max_chars=6, key="kl_manual").strip()
+else:
+    _kl_code = _kl_sel.split()[0].strip()
+
+_kl_ranges = {
+    "近3月": (_dt_kl.date.today() - _dt_kl.timedelta(days=90)).isoformat(),
+    "近6月": (_dt_kl.date.today() - _dt_kl.timedelta(days=180)).isoformat(),
+    "近1年": (_dt_kl.date.today() - _dt_kl.timedelta(days=365)).isoformat(),
+    "近3年": (_dt_kl.date.today() - _dt_kl.timedelta(days=1095)).isoformat(),
+    "全部":  "2016-01-01",
+}
+
+if _kl_code and _kl_code.isdigit() and len(_kl_code) == 6:
+    _kl_today = _dt_kl.date.today().isoformat()
+    _kl_meta = _db_kl.get_meta(_kl_code)
+    if _kl_meta is None:
+        with st.spinner(f"首次下载 {_kl_code} 历史数据…"):
+            _kl_new = _get_hist(_kl_code, days=3700)
+    elif _kl_meta["last_date"] < _kl_today:
+        with st.spinner(f"增量更新 {_kl_code}…"):
+            _kl_new = _get_hist(_kl_code, days=90)
+    else:
+        _kl_new = None
+
+    if _kl_new is not None and not _kl_new.empty:
+        _kl_name = str(_kl_new["name"].iloc[-1]) if "name" in _kl_new.columns else (_kl_meta["name"] if _kl_meta else _kl_code)
+        _kl_ld = _kl_new["date"].max()
+        _kl_lds = _kl_ld.strftime("%Y-%m-%d") if hasattr(_kl_ld, "strftime") else str(_kl_ld)[:10]
+        _db_kl.upsert_daily(_kl_code, _kl_new)
+        _db_kl.upsert_meta(_kl_code, _kl_name, _kl_lds)
+    elif _kl_meta:
+        _kl_name = _kl_meta.get("name", _kl_code)
+    else:
+        _kl_name = _kl_code
+
+    _df_kl = _db_kl.get_daily(_kl_code, start=_kl_ranges[_kl_range])
+
+    if _df_kl is None or _df_kl.empty:
+        st.warning(f"无法读取 {_kl_code} 的K线数据，请先批量下载或确认代码正确。")
+    else:
+        _period_map = {"日K": "D", "周K": "W", "月K": "M"}
+        if _kl_period == "周K":
+            _df_plot = _resample_w(_df_kl)
+        elif _kl_period == "月K":
+            _df_plot = _resample_m(_df_kl)
+        else:
+            _df_plot = _df_kl.copy()
+
+        if _df_plot.empty:
+            st.warning("该时间范围内暂无数据。")
+        else:
+            _kl_fig = _build_kl(
+                _df_plot,
+                title=f"{_kl_code}  {_kl_name}  {_kl_period}",
+                show_macd=_kl_macd,
+                period=_period_map[_kl_period],
+            )
+            st.plotly_chart(_kl_fig, use_container_width=True, config={
+                "scrollZoom": True,
+                "displayModeBar": True,
+                "modeBarButtonsToAdd": ["drawline", "eraseshape"],
+                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+            })
+elif _kl_sel == "手动输入代码" and _kl_code:
+    st.error("请输入有效的6位股票代码。")
