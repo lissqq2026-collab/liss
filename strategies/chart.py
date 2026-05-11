@@ -39,10 +39,12 @@ def resample_monthly(df: pd.DataFrame) -> pd.DataFrame:
     return m.reset_index()
 
 
-def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True) -> go.Figure:
+def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True,
+                      period: str = "D") -> go.Figure:
     """
     绘制K线图（含均线、成交量、可选MACD面板）。
     df 必须含列：date, open, high, low, close, volume
+    period: "D"=日K, "W"=周K, "M"=月K — 日K才排除周末空白
     """
     close = df["close"]
     ma5  = close.rolling(5).mean()
@@ -107,9 +109,31 @@ def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True)
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=60, r=20, t=60, b=20),
         hovermode="x unified",
+        dragmode="zoom",
     )
+    # 主图 y 轴：加深网格、关闭零线
+    fig.update_yaxes(
+        showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
+        zeroline=False, autorange=True,
+        row=1, col=1,
+    )
+    # 子图 y 轴：加深网格、自动伸缩
+    for i in range(2, rows + 1):
+        fig.update_yaxes(
+            showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
+            autorange=True,
+            row=i, col=1,
+        )
+    # 所有 x 轴：加深网格、显示轴线；日K才排除周末空白
+    xaxis_extra = {}
+    if period == "D":
+        xaxis_extra["rangebreaks"] = [{"bounds": ["sat", "mon"]}]
     for i in range(1, rows + 1):
-        fig.update_yaxes(showgrid=True, gridcolor="#EEEEEE", row=i, col=1)
-        fig.update_xaxes(showgrid=True, gridcolor="#EEEEEE", row=i, col=1)
+        fig.update_xaxes(
+            showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
+            showline=True, linecolor="#CCCCCC",
+            **xaxis_extra,
+            row=i, col=1,
+        )
 
     return fig

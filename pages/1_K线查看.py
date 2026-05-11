@@ -84,7 +84,11 @@ def _update_stock_data(code: str) -> tuple[bool, str]:
 # ── 侧边栏 ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("K线查看")
+    st.title("📈 K线查看")
+    st.caption("A股K线分析工具")
+
+    st.markdown("---")
+    st.markdown("#### 查看设置")
 
     code_input = st.text_input(
         "股票代码",
@@ -107,11 +111,13 @@ with st.sidebar:
 
     view_btn = st.button("查看K线", type="primary", use_container_width=True)
 
-    st.divider()
+    st.markdown("---")
+    st.markdown("#### 批量下载")
 
     # ── 批量下载 expander ─────────────────────────────────────────────────────
     with st.expander("批量下载全市场数据"):
         st.caption("将全市场A股历史数据下载到本地数据库（约5000只，耗时较长）")
+        st.warning("全市场下载约需30-60分钟，请保持网络连接")
         bulk_btn = st.button("开始批量下载", use_container_width=True)
 
         if bulk_btn:
@@ -160,13 +166,33 @@ with st.sidebar:
                 status_text.text(f"批量下载完成！成功 {total - error_count} 只，失败 {error_count} 只。")
                 st.success("批量下载完毕，可在K线查看或图形选股中使用本地数据。")
 
+    st.markdown("---")
+    st.caption("v2.0 · A股分析工具")
+
 
 # ── 主区域 ───────────────────────────────────────────────────────────────────
 
 st.title("K 线查看")
 
 if not view_btn:
-    st.info("请在左侧输入股票代码并点击「查看K线」。")
+    # 空状态引导卡片
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 2rem 1rem;">
+                <div style="font-size: 4rem; margin-bottom: 1rem;">🔍</div>
+                <h3 style="margin-bottom: 0.5rem; color: #374151;">输入股票代码开始查看</h3>
+                <p style="color: #6B7280; font-size: 0.95rem;">
+                    在左侧输入6位股票代码，选择K线周期与时间范围，<br>
+                    点击「查看K线」即可查看完整K线图与技术指标。
+                </p>
+                <p style="color: #9CA3AF; font-size: 0.85rem; margin-top: 1rem;">
+                    💡 首次查看某只股票会自动从网络拉取历史数据，请稍候片刻
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     st.stop()
 
 # 验证输入
@@ -211,13 +237,14 @@ if df_plot.empty:
     st.warning("重采样后数据为空，请更换时间范围或周期后重试。")
     st.stop()
 
-# 绘制图表
-chart_title = f"{code_clean}  {stock_name}  {period_label}"
-fig = build_kline_chart(df_plot, title=chart_title, show_macd=show_macd)
-st.plotly_chart(fig, use_container_width=True)
-
-# 数据信息
+# 股票指标卡（放在图表上方）
 col1, col2, col3 = st.columns(3)
 col1.metric("股票代码", code_clean)
 col2.metric("股票名称", stock_name)
 col3.metric("数据条数", f"{len(df_plot)} 根K线")
+
+# 绘制图表
+chart_title = f"{code_clean}  {stock_name}  {period_label}"
+period_code = {"日K": "D", "周K": "W", "月K": "M"}[period]
+fig = build_kline_chart(df_plot, title=chart_title, show_macd=show_macd, period=period_code)
+st.plotly_chart(fig, use_container_width=True)
