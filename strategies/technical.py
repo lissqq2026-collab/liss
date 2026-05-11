@@ -1,6 +1,6 @@
 """
 strategies/technical.py
-技术面选股策略：均线多头排列、MACD金叉、KDJ超卖回升、量价配合
+技术面选股策略：支持11个技术条件，按条件最少满足数量筛选
 依赖：pandas, numpy
 
 函数签名：screen(codes: list, params: dict) -> pd.DataFrame
@@ -17,15 +17,37 @@ from data.fetcher import get_stock_history
 
 # 默认技术面参数
 DEFAULT_PARAMS = {
-    "ma_periods": [5, 10, 20, 60],   # 均线周期列表（必须有序）
-    "macd_fast": 12,                  # MACD 快线EMA周期
-    "macd_slow": 26,                  # MACD 慢线EMA周期
-    "macd_signal": 9,                 # MACD 信号线DEA周期
-    "kdj_k_oversold": 20,             # KDJ K值超卖阈值
-    "volume_amplify_ratio": 1.5,      # 量价配合：当日成交量 / N日均量 的最低倍数
-    "volume_ma_period": 20,           # 量价配合：成交量均线周期
-    "history_days": 120,              # 拉取历史K线天数（需覆盖最长均线周期）
-    "require_all": False,             # True=四个条件全满足；False=满足≥1个即入选（可调）
+    # 均线
+    "ma_periods": [5, 10, 20, 60],
+    "check_ma_bullish": True,           # 日线均线多头排列
+    "check_price_above_ma20": False,    # 收盘价在MA20上方
+    "check_weekly_ma_bullish": False,   # 周线均线多头排列
+    # MACD
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "check_macd_golden_cross": True,    # MACD金叉
+    "check_macd_above_zero": False,     # DIF和DEA均在零轴上方
+    "check_macd_hist_expand": False,    # MACD柱连续3日放大
+    # KDJ
+    "kdj_k_oversold": 20,
+    "check_kdj_oversold_rec": True,     # KDJ超卖回升
+    "check_kdj_golden_cross": False,    # KDJ金叉（K上穿D）
+    # 量价
+    "volume_amplify_ratio": 1.5,
+    "volume_ma_period": 20,
+    "check_vol_price": True,            # 放量上涨
+    # RSI
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "check_rsi_oversold_rec": False,    # RSI超卖回升
+    # 动量
+    "momentum_days": 5,
+    "check_momentum": False,            # N日涨幅为正
+    # 筛选逻辑
+    "min_signals": 1,                   # 最少满足N个已启用条件
+    "history_days": 150,
+    "require_all": False,               # 兼容旧接口
 }
 
 
@@ -72,6 +94,17 @@ def _calc_kdj(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 9,
     d = k.ewm(com=m2 - 1, adjust=False).mean()
     j = 3 * k - 2 * d
     return k, d, j
+
+
+def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """计算RSI指标"""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 
 # ──────────────────────────── 单股票条件检测 ────────────────────────────────────
@@ -144,6 +177,72 @@ def _check_volume_price(df: pd.DataFrame, amplify_ratio: float, vol_ma_period: i
     return vol_amplified and price_up
 
 
+def _check_price_above_ma(df: pd.DataFrame, period: int = 20) -> bool:
+    """收盘价在MA20上方"""
+    if len(df) < period:
+        return False
+    return df["close"].iloc[-1] > _calc_ma(df["close"], period).iloc[-1]
+
+
+def _check_weekly_ma_bullish(df: pd.DataFrame, periods: tuple = (5, 10, 20)) -> bool:
+    """日线数据重采样为周线，检验周线均线多头排列"""
+    if "date" not in df.columns or len(df) < max(periods) * 6:
+        return False
+    df_w = df.set_index("date").resample("W")["close"].last().dropna()
+    if len(df_w) < max(periods):
+        return False
+    mas = [_calc_ma(df_w, p).iloc[-1] for p in periods]
+    return all(mas[i] > mas[i + 1] for i in range(len(mas) - 1))
+
+
+def _check_macd_above_zero(df: pd.DataFrame, fast: int, slow: int, signal: int) -> bool:
+    """DIF和DEA均在零轴上方"""
+    if len(df) < slow + signal + 5:
+        return False
+    dif, dea, _ = _calc_macd(df["close"], fast, slow, signal)
+    return float(dif.iloc[-1]) > 0 and float(dea.iloc[-1]) > 0
+
+
+def _check_macd_hist_expanding(df: pd.DataFrame, fast: int, slow: int, signal: int) -> bool:
+    """MACD柱（红柱）连续3日为正且扩大"""
+    if len(df) < slow + signal + 5:
+        return False
+    _, _, hist = _calc_macd(df["close"], fast, slow, signal)
+    h = hist.dropna().iloc[-3:]
+    if len(h) < 3:
+        return False
+    return (h > 0).all() and float(h.iloc[-1]) > float(h.iloc[-2]) > float(h.iloc[-3])
+
+
+def _check_kdj_golden_cross(df: pd.DataFrame) -> bool:
+    """KDJ金叉：K上穿D（前一日K<=D，当日K>D）"""
+    if len(df) < 15:
+        return False
+    k, d, _ = _calc_kdj(df["high"], df["low"], df["close"])
+    if len(k) < 2:
+        return False
+    return (float(k.iloc[-1]) > float(d.iloc[-1])) and (float(k.iloc[-2]) <= float(d.iloc[-2]))
+
+
+def _check_rsi_oversold_recovery(df: pd.DataFrame, period: int = 14, threshold: int = 30) -> bool:
+    """RSI超卖回升：近期曾低于阈值，当前回升且未超买"""
+    if len(df) < period + 10:
+        return False
+    rsi = _calc_rsi(df["close"], period)
+    recent = rsi.iloc[-10:]
+    was_oversold = (recent < threshold).any()
+    is_rising = float(rsi.iloc[-1]) > float(rsi.iloc[-2])
+    not_overbought = float(rsi.iloc[-1]) < 70
+    return was_oversold and is_rising and not_overbought
+
+
+def _check_momentum(df: pd.DataFrame, days: int = 5) -> bool:
+    """N日涨幅为正：当前收盘价高于N日前收盘价"""
+    if len(df) < days + 1:
+        return False
+    return float(df["close"].iloc[-1]) > float(df["close"].iloc[-(days + 1)])
+
+
 # ──────────────────────────── 主筛选函数 ────────────────────────────────────────
 
 def screen(codes: list, params: dict = None) -> pd.DataFrame:
@@ -157,10 +256,7 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
     返回：
         DataFrame，列：
             code              - 股票代码
-            ma_bullish        - 均线多头排列
-            macd_golden_cross - MACD金叉
-            kdj_oversold_rec  - KDJ超卖回升
-            vol_price_match   - 量价配合
+            <各已启用条件名>  - 各条件布尔值（仅已启用条件出现）
             signal_count      - 满足条件数量（越多越优先）
     """
     if not codes:
@@ -171,12 +267,36 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
     ma_periods      = cfg["ma_periods"]
     macd_fast       = cfg["macd_fast"]
     macd_slow       = cfg["macd_slow"]
-    macd_signal     = cfg["macd_signal"]
+    macd_signal_p   = cfg["macd_signal"]
     k_oversold      = cfg["kdj_k_oversold"]
     vol_ratio       = cfg["volume_amplify_ratio"]
     vol_ma_period   = cfg["volume_ma_period"]
+    rsi_period      = cfg["rsi_period"]
+    rsi_oversold    = cfg["rsi_oversold"]
+    momentum_days   = cfg["momentum_days"]
     history_days    = cfg["history_days"]
     require_all     = cfg["require_all"]
+
+    # 构建条件开关字典
+    checks = {
+        "ma_bullish":        cfg.get("check_ma_bullish", True),
+        "price_above_ma20":  cfg.get("check_price_above_ma20", False),
+        "weekly_ma_bullish": cfg.get("check_weekly_ma_bullish", False),
+        "macd_golden_cross": cfg.get("check_macd_golden_cross", True),
+        "macd_above_zero":   cfg.get("check_macd_above_zero", False),
+        "macd_hist_expand":  cfg.get("check_macd_hist_expand", False),
+        "kdj_oversold_rec":  cfg.get("check_kdj_oversold_rec", True),
+        "kdj_golden_cross":  cfg.get("check_kdj_golden_cross", False),
+        "vol_price_match":   cfg.get("check_vol_price", True),
+        "rsi_oversold_rec":  cfg.get("check_rsi_oversold_rec", False),
+        "momentum":          cfg.get("check_momentum", False),
+    }
+
+    enabled_count = sum(checks.values())
+    if require_all:
+        min_signals = enabled_count
+    else:
+        min_signals = cfg.get("min_signals", 1)
 
     records = []
     total = len(codes)
@@ -187,37 +307,49 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
         if df.empty or len(df) < max(ma_periods) + 5:
             continue
 
-        ma_ok   = _check_ma_bullish(df, ma_periods)
-        macd_ok = _check_macd_golden_cross(df, macd_fast, macd_slow, macd_signal)
-        kdj_ok  = _check_kdj_oversold_recovery(df, k_oversold)
-        vp_ok   = _check_volume_price(df, vol_ratio, vol_ma_period)
+        # 逐条件计算（只计算已启用的条件）
+        result = {}
+        if checks["ma_bullish"]:
+            result["ma_bullish"] = _check_ma_bullish(df, ma_periods)
+        if checks["price_above_ma20"]:
+            result["price_above_ma20"] = _check_price_above_ma(df, 20)
+        if checks["weekly_ma_bullish"]:
+            result["weekly_ma_bullish"] = _check_weekly_ma_bullish(df)
+        if checks["macd_golden_cross"]:
+            result["macd_golden_cross"] = _check_macd_golden_cross(df, macd_fast, macd_slow, macd_signal_p)
+        if checks["macd_above_zero"]:
+            result["macd_above_zero"] = _check_macd_above_zero(df, macd_fast, macd_slow, macd_signal_p)
+        if checks["macd_hist_expand"]:
+            result["macd_hist_expand"] = _check_macd_hist_expanding(df, macd_fast, macd_slow, macd_signal_p)
+        if checks["kdj_oversold_rec"]:
+            result["kdj_oversold_rec"] = _check_kdj_oversold_recovery(df, k_oversold)
+        if checks["kdj_golden_cross"]:
+            result["kdj_golden_cross"] = _check_kdj_golden_cross(df)
+        if checks["vol_price_match"]:
+            result["vol_price_match"] = _check_volume_price(df, vol_ratio, vol_ma_period)
+        if checks["rsi_oversold_rec"]:
+            result["rsi_oversold_rec"] = _check_rsi_oversold_recovery(df, rsi_period, rsi_oversold)
+        if checks["momentum"]:
+            result["momentum"] = _check_momentum(df, momentum_days)
 
-        signal_count = sum([ma_ok, macd_ok, kdj_ok, vp_ok])
+        signal_count = sum(result.values())
 
-        # 过滤逻辑
-        if require_all:
-            if not (ma_ok and macd_ok and kdj_ok and vp_ok):
-                continue
-        else:
-            if signal_count == 0:
-                continue
+        # 过滤：已启用条件中满足数量不足则跳过
+        if signal_count < min_signals:
+            continue
 
-        records.append({
-            "code": code,
-            "ma_bullish": ma_ok,
-            "macd_golden_cross": macd_ok,
-            "kdj_oversold_rec": kdj_ok,
-            "vol_price_match": vp_ok,
-            "signal_count": signal_count,
-        })
+        row = {"code": code}
+        row.update(result)
+        row["signal_count"] = signal_count
+        records.append(row)
 
     print()  # 换行
-    result = pd.DataFrame(records)
-    if not result.empty:
-        result = result.sort_values("signal_count", ascending=False).reset_index(drop=True)
+    df_result = pd.DataFrame(records)
+    if not df_result.empty:
+        df_result = df_result.sort_values("signal_count", ascending=False).reset_index(drop=True)
 
-    print(f"[technical] 技术面筛选完成，从 {total} 只中选出 {len(result)} 只")
-    return result
+    print(f"[technical] 技术面筛选完成，从 {total} 只中选出 {len(df_result)} 只")
+    return df_result
 
 
 if __name__ == "__main__":
