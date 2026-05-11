@@ -80,7 +80,7 @@ def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True,
     for (ma_series, label) in [(ma5, "MA5"), (ma10, "MA10"), (ma20, "MA20"), (ma60, "MA60")]:
         fig.add_trace(go.Scatter(
             x=df["date"], y=ma_series, name=label,
-            line=dict(color=_MA[label], width=1), mode="lines",
+            line=dict(color=_MA[label], width=1.2), mode="lines",
         ), row=1, col=1)
 
     # ── 成交量 ────────────────────────────────────────────────────────────────
@@ -109,22 +109,24 @@ def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=60, r=20, t=60, b=20),
         hovermode="x unified",
-        dragmode="zoom",
+        dragmode="pan",
+        spikedistance=-1,
+        hoverdistance=-1,
     )
     # 主图 y 轴：加深网格、关闭零线
     fig.update_yaxes(
         showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
         zeroline=False, autorange=True,
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikecolor="#999999", spikethickness=1, spikedash="dot",
         row=1, col=1,
     )
-    # 子图 y 轴：加深网格、自动伸缩
     for i in range(2, rows + 1):
         fig.update_yaxes(
             showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
             autorange=True,
             row=i, col=1,
         )
-    # 所有 x 轴：加深网格、显示轴线；日K才排除周末空白
     xaxis_extra = {}
     if period == "D":
         xaxis_extra["rangebreaks"] = [{"bounds": ["sat", "mon"]}]
@@ -132,6 +134,8 @@ def build_kline_chart(df: pd.DataFrame, title: str = "", show_macd: bool = True,
         fig.update_xaxes(
             showgrid=True, gridcolor="#E0E0E0", gridwidth=1,
             showline=True, linecolor="#CCCCCC",
+            showspikes=True, spikemode="across", spikesnap="cursor",
+            spikecolor="#999999", spikethickness=1, spikedash="solid",
             **xaxis_extra,
             row=i, col=1,
         )

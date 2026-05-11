@@ -247,4 +247,8 @@ col3.metric("数据条数", f"{len(df_plot)} 根K线")
 chart_title = f"{code_clean}  {stock_name}  {period_label}"
 period_code = {"日K": "D", "周K": "W", "月K": "M"}[period]
 fig = build_kline_chart(df_plot, title=chart_title, show_macd=show_macd, period=period_code)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True, config={
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+})

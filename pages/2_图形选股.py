@@ -272,4 +272,8 @@ if selected_label:
             title=f"{sel_code}  {sel_name}  日K",
             show_macd=show_macd_detail,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config={
+            "scrollZoom": True,
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+        })
