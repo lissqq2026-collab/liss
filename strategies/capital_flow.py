@@ -9,6 +9,7 @@ strategies/capital_flow.py
 import pandas as pd
 import akshare as ak
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import sys
 import os
 
@@ -32,12 +33,18 @@ def _get_hsgt_history_by_stock(code: str, market: str, days: int = 10) -> pd.Dat
     数据来源：东财沪深港通个股持股历史
     """
     try:
-        df = ak.stock_em_hsgt_individual_detail(
-            symbol=code,
-            start_date=(datetime.today() - timedelta(days=days * 2)).strftime("%Y%m%d"),
-            end_date=datetime.today().strftime("%Y%m%d"),
-            market=market,
-        )
+        _start = (datetime.today() - timedelta(days=days * 2)).strftime("%Y%m%d")
+        _end   = datetime.today().strftime("%Y%m%d")
+        with ThreadPoolExecutor(max_workers=1) as _tex:
+            _fut = _tex.submit(
+                ak.stock_em_hsgt_individual_detail,
+                symbol=code, start_date=_start, end_date=_end, market=market,
+            )
+            try:
+                df = _fut.result(timeout=10)
+            except FuturesTimeoutError:
+                print(f"[capital_flow] 获取 {code}({market}) 超时（10s）")
+                return pd.DataFrame()
         rename_map = {
             "日期": "date",
             "持股数量": "hold_shares",
@@ -69,7 +76,7 @@ def _is_consecutive_inflow(df: pd.DataFrame, min_days: int) -> bool:
     return (recent > 0).all()
 
 
-def screen(params: dict = None) -> pd.DataFrame:
+def screen(params: dict = None, progress_cb=None) -> tuple:
     """
     资金流向选股：筛选北向资金近N日持续净流入（持续增持）的A股。
 
@@ -110,31 +117,51 @@ def screen(params: dict = None) -> pd.DataFrame:
     if snapshot.empty:
         return pd.DataFrame()
 
-    print(f"[capital_flow] 快照共 {len(snapshot)} 条，开始逐股分析...")
+    print(f"[capital_flow] 快照共 {len(snapshot)} 条，开始预筛选...")
+
+    # ── 预筛选：今日 hold_change > 0 才可能满足连续增持条件 ────────────────
+    if "hold_change" in snapshot.columns:
+        candidates = snapshot[snapshot["hold_change"] > 0].copy()
+        print(f"[capital_flow] 预筛选后候选 {len(candidates)} 只（跳过 {len(snapshot) - len(candidates)} 只今日未增持）")
+    else:
+        candidates = snapshot.copy()
+
+    if candidates.empty:
+        return pd.DataFrame()
 
     records = []
-    total = len(snapshot)
+    total = len(candidates)
 
-    for idx, row in snapshot.iterrows():
-        code = str(row.get("code", "")).zfill(6)
-        name = row.get("name", "")
-        market = row.get("market", "")
+    # 用于区分 API 失败 vs 不满足条件
+    _API_FAIL = "__api_fail__"
+
+    def _check_one(row: pd.Series):
+        code        = str(row.get("code", "")).zfill(6)
+        name        = row.get("name", "")
+        market      = row.get("market", "")
         hold_shares = row.get("hold_shares", 0)
-        hold_ratio = row.get("hold_ratio", 0)
-
-        print(f"[capital_flow] 分析 {code} {name} ({idx+1}/{total})...", end="\r")
+        hold_ratio  = row.get("hold_ratio", 0)
 
         # ── 步骤2：拉取个股历史持仓变动 ──────────────────────────────────
         hist = _get_hsgt_history_by_stock(code, market, days=min_days + 5)
+        if hist is None:
+            return _API_FAIL
         if hist.empty:
-            continue
+            return _API_FAIL
 
-        # ── 步骤3：判断连续净增持 ──────────────────────────────────────────
-        recent = hist["hold_change"].dropna().tail(min_days)
-        if len(recent) < min_days:
-            continue
+        # ── 步骤3：判断连续净增持（验证日期连续性）────────────────────────────
+        hist_sorted = hist.sort_values("date").dropna(subset=["hold_change"])
+        recent_rows = hist_sorted.tail(min_days)
+        if len(recent_rows) < min_days:
+            return None
 
-        # 实际连续净增持天数（从最近一天往前数）
+        # 验证相邻交易日差不超过5自然日（最长连休4天+1个交易日）
+        dates = pd.to_datetime(recent_rows["date"]).tolist()
+        for i in range(1, len(dates)):
+            if (dates[i] - dates[i - 1]).days > 5:
+                return None  # 日期断层，数据不连续
+
+        recent = recent_rows["hold_change"]
         consecutive = 0
         for chg in reversed(recent.tolist()):
             if chg > 0:
@@ -143,24 +170,58 @@ def screen(params: dict = None) -> pd.DataFrame:
                 break
 
         if consecutive < min_days:
-            continue
+            return None
 
         # ── 步骤4：计算累计增持量 ─────────────────────────────────────────
         total_increase = recent[recent > 0].sum()
         if total_increase < min_increase:
-            continue
+            return None
 
-        records.append({
-            "code": code,
-            "name": name,
-            "market": market,
-            "hold_shares": hold_shares,
-            "hold_ratio": hold_ratio,
+        hold_change_pct = round(total_increase / hold_shares * 100, 4) if hold_shares and hold_shares > 0 else 0.0
+        return {
+            "code":             code,
+            "name":             name,
+            "market":           market,
+            "hold_shares":      hold_shares,
+            "hold_ratio":       hold_ratio,
             "consecutive_days": consecutive,
-            "total_increase": total_increase,
-        })
+            "total_increase":   total_increase,
+            "hold_change_pct":  hold_change_pct,
+        }
+
+    print(f"[capital_flow] 并发分析 {total} 只候选股票（workers=5）...")
+    api_fail_count = 0
+    done_count = 0
+    timeout_count = 0
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_check_one, row): row for _, row in candidates.iterrows()}
+        try:
+            for future in as_completed(futures, timeout=180):
+                done_count += 1
+                item = future.result()
+                if item == _API_FAIL:
+                    api_fail_count += 1
+                elif item is not None:
+                    records.append(item)
+                if progress_cb:
+                    progress_cb(done_count / total)
+                if done_count % 10 == 0 or done_count == total:
+                    print(f"[capital_flow] 进度 {done_count}/{total}，命中 {len(records)} 只...", end="\r")
+        except FuturesTimeoutError:
+            timeout_count = total - done_count
+            print(f"\n[capital_flow] 总超时（180s），{timeout_count} 只未完成，返回部分结果")
+            if progress_cb:
+                progress_cb(1.0)
 
     print()  # 换行
+
+    meta: dict = {"api_fail_count": api_fail_count, "total_candidates": total, "timeout_count": timeout_count}
+    if api_fail_count > 0:
+        fail_ratio = api_fail_count / total
+        if fail_ratio > 0.5:
+            print(f"[capital_flow] 警告：{api_fail_count}/{total} 只股票API请求失败（可能被限流），结果可能不完整")
+        else:
+            print(f"[capital_flow] {api_fail_count} 只股票API请求失败（其余正常）")
 
     result = pd.DataFrame(records)
     if not result.empty:
@@ -170,7 +231,7 @@ def screen(params: dict = None) -> pd.DataFrame:
         ).reset_index(drop=True)
 
     print(f"[capital_flow] 北向资金筛选完成，共选出 {len(result)} 只持续净流入股票")
-    return result
+    return result, meta
 
 
 def screen_by_aggregate_flow(params: dict = None) -> pd.DataFrame:

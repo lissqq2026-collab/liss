@@ -11,11 +11,12 @@ import pandas as pd
 
 # 默认筛选参数（可被调用方 params 覆盖）
 DEFAULT_PARAMS = {
-    "pe_min": 0,          # PE下限（剔除负PE/亏损股）
-    "pe_max": 30,         # PE上限
-    "pb_max": 3.0,        # PB上限
-    "total_mv_min": 20,   # 总市值下限（亿元）—— 小盘下边界
-    "total_mv_max": 500,  # 总市值上限（亿元）—— 中盘上边界
+    "pe_min": 0,           # PE下限（剔除负PE/亏损股）
+    "pe_max": 80,          # PE上限
+    "pb_max": 5.0,         # PB上限
+    "total_mv_min": 20,    # 总市值下限（亿元）—— 小盘下边界
+    "total_mv_max": 1000,  # 总市值上限（亿元）—— 中盘上边界
+    "roe_min": 0.0,        # ROE下限(%)，0=不过滤；ROE近似值=PB/PE×100
     "pct_exclude_limit": 9.0,  # 涨跌幅绝对值超过此阈值视为涨停/跌停（科创板/创业板为20%）
 }
 
@@ -51,6 +52,9 @@ def screen(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
 
     result = result.dropna(subset=required_cols)
 
+    # ── 1b. 派生 ROE 近似值（ROE ≈ PB/PE × 100，PE clip防止除以0）────────────
+    result["roe_approx"] = (result["pb"] / result["pe"].clip(lower=1) * 100).round(2)
+
     # ── 2. PE 范围筛选（剔除亏损股及高估值） ──────────────────────────────────
     pe_min = cfg["pe_min"]
     pe_max = cfg["pe_max"]
@@ -68,12 +72,36 @@ def screen(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     result = result[(result["total_mv"] >= mv_min) & (result["total_mv"] <= mv_max)]
     print(f"[fundamental] 市值({mv_min}~{mv_max}亿)筛选后: {len(result)} 只")
 
-    # ── 5. 排除涨停/跌停（避免追涨杀跌）─────────────────────────────────────
-    limit_pct = cfg["pct_exclude_limit"]
-    result = result[result["pct_change"].abs() < limit_pct]
-    print(f"[fundamental] 排除涨跌停(|涨跌幅|<{limit_pct}%)筛选后: {len(result)} 只")
+    # ── 5. ROE 下限筛选（用近似值 PB/PE×100） ────────────────────────────────
+    roe_min = cfg["roe_min"]
+    if roe_min > 0:
+        result = result[result["roe_approx"] >= roe_min]
+        print(f"[fundamental] ROE(≥{roe_min}%)筛选后: {len(result)} 只")
 
-    # ── 6. 按总市值升序排列（优先小盘）──────────────────────────────────────
+    # ── 6. 排除涨停/跌停（按板块动态阈值：主板10%，创业板/科创板20%，北交所30%）
+    def _limit_pct(code: str) -> float:
+        s = str(code)
+        if s.startswith("688") or s.startswith("300") or s.startswith("301"):
+            return 20.0
+        if s.startswith("8") or s.startswith("4"):
+            return 30.0
+        return 10.0
+
+    if "code" in result.columns:
+        result = result[result.apply(
+            lambda row: abs(row["pct_change"]) < _limit_pct(row["code"]), axis=1
+        )]
+    else:
+        limit_pct = cfg["pct_exclude_limit"]
+        result = result[result["pct_change"].abs() < limit_pct]
+    print(f"[fundamental] 排除涨跌停（按板块阈值）筛选后: {len(result)} 只")
+
+    # ── 7. 排除 ST / *ST / 退市整理股 ────────────────────────────────────────
+    if "name" in result.columns:
+        result = result[~result["name"].str.contains(r"ST|退", na=False, regex=True)]
+        print(f"[fundamental] 排除ST/退市后: {len(result)} 只")
+
+    # ── 8. 按总市值升序排列（优先小盘）──────────────────────────────────────
     result = result.sort_values("total_mv", ascending=True).reset_index(drop=True)
 
     print(f"[fundamental] 最终选出 {len(result)} 只股票")

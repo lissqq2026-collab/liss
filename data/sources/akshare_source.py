@@ -14,8 +14,17 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import threading
+import time
 import pandas as pd
 from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------------------
+# 股票列表 TTL 缓存（1小时），减少 _bs_lock 持有频率
+# ---------------------------------------------------------------------------
+_all_codes_cache: dict = {"data": None, "ts": 0.0}
+_all_codes_cache_lock = threading.Lock()
+_ALL_CODES_TTL = 3600
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +61,7 @@ def _tencent_batch_query(codes_with_prefix: list) -> list:
                 except IndexError:
                     continue
                 fields = data_part.split("~")
-                if len(fields) < 50:
+                if len(fields) < 66:
                     continue
                 try:
                     def _f(idx):
@@ -66,15 +75,16 @@ def _tencent_batch_query(codes_with_prefix: list) -> list:
                         continue
 
                     results.append({
-                        "code":       _f(2),
-                        "name":       _f(1),
-                        "price":      price,
-                        "pct_change": float(_f(32)) if _f(32) else None,
-                        "volume":     float(_f(36)) if _f(36) else None,
-                        "amount":     float(_f(37)) * 10000 if _f(37) else None,
-                        "pb":         float(_f(43)) if _f(43) else None,
-                        "total_mv":   float(_f(44)) if _f(44) else None,
-                        "pe":         float(_f(65)) if _f(65) else None,
+                        "code":          _f(2),
+                        "name":          _f(1),
+                        "price":         price,
+                        "pct_change":    float(_f(32)) if _f(32) else None,
+                        "volume":        float(_f(36)) if _f(36) else None,
+                        "amount":        float(_f(37)) * 10000 if _f(37) else None,
+                        "turnover_rate": float(_f(38)) if _f(38) else None,
+                        "pb":            float(_f(43)) if _f(43) else None,
+                        "total_mv":      float(_f(44)) if _f(44) else None,
+                        "pe":            float(_f(65)) if _f(65) else None,
                     })
                 except (ValueError, IndexError):
                     continue
@@ -92,54 +102,71 @@ def _tencent_batch_query(codes_with_prefix: list) -> list:
 def _baostock_get_all_codes() -> list:
     """
     返回 [{"prefix_code": "sh600000", "code": "600000", "name": "浦发银行"}, ...]
-    自动往回最多10个工作日查找有数据的交易日。
+    自动往回最多10个工作日查找有数据的交易日。结果缓存1小时，避免频繁持锁。
     """
+    with _all_codes_cache_lock:
+        if _all_codes_cache["data"] and (time.time() - _all_codes_cache["ts"]) < _ALL_CODES_TTL:
+            return _all_codes_cache["data"]
+
+    import socket
+    from data.sources._baostock_utils import _bs_lock
     import baostock as bs
 
+    result = []
+    _orig_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
     try:
-        bs.login()
-        day = datetime.today()
-        for _ in range(14):
-            day -= timedelta(days=1)
-            if day.weekday() >= 5:
-                continue
-            day_str = day.strftime("%Y-%m-%d")
-            rs = bs.query_all_stock(day=day_str)
-            if rs.error_code != "0":
-                continue
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            if not rows:
-                continue
+        with _bs_lock:
+            try:
+                bs.login()
+                day = datetime.today()
+                for _ in range(30):
+                    day -= timedelta(days=1)
+                    if day.weekday() >= 5:
+                        continue
+                    day_str = day.strftime("%Y-%m-%d")
+                    rs = bs.query_all_stock(day=day_str)
+                    if rs.error_code != "0":
+                        continue
+                    rows = []
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+                    if not rows:
+                        continue
 
-            result = []
-            for row in rows:
-                bs_code = row[0]          # e.g. sh.600000
-                name    = row[2] if len(row) > 2 else ""
-                parts   = bs_code.split(".")
-                if len(parts) != 2:
-                    continue
-                prefix, code = parts[0], parts[1]
-                if (prefix == "sh" and code.startswith("6")) or \
-                   (prefix == "sz" and (code.startswith("0") or code.startswith("3"))):
-                    result.append({
-                        "prefix_code": f"{prefix}{code}",
-                        "code": code,
-                        "name": name,
-                    })
-            if result:
-                print(f"[akshare_source] baostock query_all_stock({day_str}) -> {len(result)} 只A股")
-                return result
-    except Exception as e:
-        print(f"[akshare_source] baostock 获取股票列表失败: {e}")
+                    for row in rows:
+                        bs_code = row[0]          # e.g. sh.600000
+                        name    = row[2] if len(row) > 2 else ""
+                        parts   = bs_code.split(".")
+                        if len(parts) != 2:
+                            continue
+                        prefix, code = parts[0], parts[1]
+                        if (prefix == "sh" and code.startswith("6")) or \
+                           (prefix == "sz" and (code.startswith("0") or code.startswith("3"))):
+                            result.append({
+                                "prefix_code": f"{prefix}{code}",
+                                "code": code,
+                                "name": name,
+                            })
+                    if result:
+                        print(f"[akshare_source] baostock query_all_stock({day_str}) -> {len(result)} 只A股")
+                        break
+            except Exception as e:
+                print(f"[akshare_source] baostock 获取股票列表失败: {e}")
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
     finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+        socket.setdefaulttimeout(_orig_timeout)
 
-    return []
+    if result:
+        with _all_codes_cache_lock:
+            _all_codes_cache["data"] = result
+            _all_codes_cache["ts"] = time.time()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +204,7 @@ def get_all_a_stock_realtime(config: dict = None) -> pd.DataFrame:
 
     df = df[df["price"].notna() & (df["price"] > 0)].reset_index(drop=True)
 
-    out_cols = ["code", "name", "price", "pct_change", "pe", "pb", "total_mv", "volume", "amount"]
+    out_cols = ["code", "name", "price", "pct_change", "pe", "pb", "total_mv", "turnover_rate", "volume", "amount"]
     df = df[[c for c in out_cols if c in df.columns]]
 
     print(f"[akshare_source] 实时行情获取成功（baostock+腾讯），共 {len(df)} 条记录")
@@ -187,70 +214,10 @@ def get_all_a_stock_realtime(config: dict = None) -> pd.DataFrame:
 def get_stock_history(code: str, days: int = 120, config: dict = None) -> pd.DataFrame:
     """
     获取指定股票的日线历史K线数据（前复权）。
-    使用 baostock（东方财富/AKShare 已被网络屏蔽）。
-
-    参数：
-        code  - 股票代码（6位纯数字字符串，如 "000001"）
-        days  - 获取最近N个交易日的数据，默认120天
-    返回 DataFrame 列：
-        date(datetime), open, high, low, close, volume, amount, pct_change
-    按日期升序排列。失败时返回空 DataFrame。
+    返回 DataFrame 列：date(datetime), open, high, low, close, volume, amount, pct_change
     """
-    import baostock as bs
-
-    try:
-        bs.login()
-
-        prefix = "sh" if code.startswith("6") else "sz"
-        bs_code = f"{prefix}.{code}"
-
-        end_date   = datetime.today().strftime("%Y-%m-%d")
-        start_date = (datetime.today() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
-
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount,pctChg",
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",
-        )
-
-        if rs.error_code != "0":
-            print(f"[akshare_source] baostock history 错误: {rs.error_code} {rs.error_msg}")
-            return pd.DataFrame()
-
-        data_list = []
-        while rs.error_code == "0" and rs.next():
-            data_list.append(rs.get_row_data())
-
-        if not data_list:
-            print(f"[akshare_source] get_stock_history({code}) 无数据")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        df = df.rename(columns={"pctChg": "pct_change"})
-        df["date"] = pd.to_datetime(df["date"])
-
-        numeric_cols = ["open", "high", "low", "close", "volume", "amount", "pct_change"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        keep = [c for c in ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
-                if c in df.columns]
-        df = df[keep].sort_values("date").tail(days).reset_index(drop=True)
-        return df
-
-    except Exception as e:
-        print(f"[akshare_source] get_stock_history({code}) 失败: {e}")
-        return pd.DataFrame()
-
-    finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+    from data.sources._baostock_utils import bs_get_stock_history
+    return bs_get_stock_history(code, days, caller="akshare_source")
 
 
 def get_northbound_flow(config: dict = None) -> pd.DataFrame:
@@ -343,3 +310,9 @@ def get_northbound_holdings(config: dict = None) -> pd.DataFrame:
     except Exception as e:
         print(f"[akshare_source] get_northbound_holdings 失败: {e}")
         return pd.DataFrame()
+
+
+def get_stock_history_batch(codes: list, days: int = 120, config: dict = None) -> dict:
+    """批量获取历史K线，共享 baostock 会话。"""
+    from data.sources._baostock_utils import bs_batch_get_stock_history
+    return bs_batch_get_stock_history(codes, days, caller="akshare_source")

@@ -12,7 +12,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.fetcher import get_stock_history
+from data.fetcher import get_stock_history, get_stock_history_batch
 
 
 # 默认技术面参数
@@ -30,22 +30,22 @@ DEFAULT_PARAMS = {
     "check_macd_above_zero": False,     # DIF和DEA均在零轴上方
     "check_macd_hist_expand": False,    # MACD柱连续3日放大
     # KDJ
-    "kdj_k_oversold": 20,
+    "kdj_k_oversold": 30,
     "check_kdj_oversold_rec": True,     # KDJ超卖回升
     "check_kdj_golden_cross": False,    # KDJ金叉（K上穿D）
     # 量价
-    "volume_amplify_ratio": 1.5,
+    "volume_amplify_ratio": 2.0,
     "volume_ma_period": 20,
     "check_vol_price": True,            # 放量上涨
     # RSI
     "rsi_period": 14,
-    "rsi_oversold": 30,
+    "rsi_oversold": 25,
     "check_rsi_oversold_rec": False,    # RSI超卖回升
     # 动量
     "momentum_days": 5,
     "check_momentum": False,            # N日涨幅为正
     # 筛选逻辑
-    "min_signals": 1,                   # 最少满足N个已启用条件
+    "min_signals": 2,                   # 最少满足N个已启用条件
     "history_days": 150,
     "require_all": False,               # 兼容旧接口
 }
@@ -121,18 +121,33 @@ def _check_ma_bullish(df: pd.DataFrame, periods: list) -> bool:
     return all(mas[i] > mas[i + 1] for i in range(len(mas) - 1))
 
 
-def _check_macd_golden_cross(df: pd.DataFrame, fast: int, slow: int, signal: int) -> bool:
+def _check_macd_golden_cross(
+    df: pd.DataFrame, fast: int, slow: int, signal: int,
+    require_above_zero: bool = False,
+) -> bool:
     """
-    MACD 金叉：最新DIF上穿DEA（前一日DIF<=DEA，当日DIF>DEA）
+    MACD 金叉：近3个交易日内DIF上穿DEA（且当前DIF仍在DEA上方）。
+    require_above_zero=True 时额外要求 DIF 和 DEA 均在零轴上方（A股实战推荐）。
     """
     if len(df) < slow + signal + 5:
         return False
     dif, dea, _ = _calc_macd(df["close"], fast, slow, signal)
-    if len(dif) < 2:
+    if len(dif) < 3:
         return False
-    # 当日DIF > DEA，且前一日DIF <= DEA
-    cross = (dif.iloc[-1] > dea.iloc[-1]) and (dif.iloc[-2] <= dea.iloc[-2])
-    return cross
+    # 当前 DIF 必须仍在 DEA 上方（金叉有效）
+    if dif.iloc[-1] <= dea.iloc[-1]:
+        return False
+    # 近3日内任意一天发生上穿（DIF从DEA下方穿到上方）
+    n = min(3, len(dif) - 1)
+    crossed = any(
+        (dif.iloc[-k] > dea.iloc[-k]) and (dif.iloc[-k - 1] <= dea.iloc[-k - 1])
+        for k in range(1, n + 1)
+    )
+    if not crossed:
+        return False
+    if require_above_zero:
+        return float(dif.iloc[-1]) > 0 and float(dea.iloc[-1]) > 0
+    return True
 
 
 def _check_kdj_oversold_recovery(df: pd.DataFrame, k_threshold: int) -> bool:
@@ -148,13 +163,13 @@ def _check_kdj_oversold_recovery(df: pd.DataFrame, k_threshold: int) -> bool:
     if k.isna().all():
         return False
 
-    k_recent = k.iloc[-10:]   # 近10日
+    k_recent = k.iloc[-10:]   # 近10日（A股底部震荡通常持续10-15个交易日）
     k_last = k.iloc[-1]
     k_prev = k.iloc[-2]
 
-    # 条件：近10日曾低于超卖线 & 当日回升 & 还没涨过头
+    # 条件：近10日曾低于超卖线 & 连续2日回升 & 还没涨过头
     was_oversold = (k_recent < k_threshold).any()
-    is_rising = k_last > k_prev
+    is_rising = (k_last > k_prev) and (k_prev > float(k.iloc[-3]))
     not_overbought = k_last < 50
     return was_oversold and is_rising and not_overbought
 
@@ -225,13 +240,16 @@ def _check_kdj_golden_cross(df: pd.DataFrame) -> bool:
 
 
 def _check_rsi_oversold_recovery(df: pd.DataFrame, period: int = 14, threshold: int = 30) -> bool:
-    """RSI超卖回升：近期曾低于阈值，当前回升且未超买"""
-    if len(df) < period + 10:
+    """RSI超卖回升：近5日内曾低于阈值，且连续2日回升且未超买"""
+    if len(df) < period + 5:
         return False
     rsi = _calc_rsi(df["close"], period)
-    recent = rsi.iloc[-10:]
+    recent = rsi.iloc[-5:]
     was_oversold = (recent < threshold).any()
-    is_rising = float(rsi.iloc[-1]) > float(rsi.iloc[-2])
+    is_rising = (
+        float(rsi.iloc[-1]) > float(rsi.iloc[-2])
+        and float(rsi.iloc[-2]) > float(rsi.iloc[-3])
+    )
     not_overbought = float(rsi.iloc[-1]) < 70
     return was_oversold and is_rising and not_overbought
 
@@ -243,9 +261,19 @@ def _check_momentum(df: pd.DataFrame, days: int = 5) -> bool:
     return float(df["close"].iloc[-1]) > float(df["close"].iloc[-(days + 1)])
 
 
+def _calc_volume_ratio(df: pd.DataFrame, period: int = 5) -> float:
+    """量比：今日成交量 / 近N日均量（不含今日）"""
+    if len(df) < period + 1 or "volume" not in df.columns:
+        return float("nan")
+    avg = df["volume"].iloc[-(period + 1):-1].mean()
+    if avg == 0:
+        return float("nan")
+    return round(float(df["volume"].iloc[-1] / avg), 2)
+
+
 # ──────────────────────────── 主筛选函数 ────────────────────────────────────────
 
-def screen(codes: list, params: dict = None) -> pd.DataFrame:
+def screen(codes: list, params: dict = None, progress_cb=None) -> pd.DataFrame:
     """
     技术面选股：对给定股票代码列表逐一拉取K线并检验技术条件。
 
@@ -301,9 +329,28 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
     records = []
     total = len(codes)
 
+    # 优先从本地数据库读取（毫秒级），缺失的再走网络
+    from data.db import manager as _local_db
+    history_map: dict[str, pd.DataFrame] = {}
+    missing_codes: list[str] = []
+    for code in codes:
+        df_local = _local_db.get_daily(code)
+        if df_local is not None and not df_local.empty:
+            history_map[code] = df_local.tail(history_days).reset_index(drop=True)
+        else:
+            missing_codes.append(code)
+
+    print(f"[technical] 本地数据库命中 {total - len(missing_codes)}/{total} 只")
+    if missing_codes:
+        print(f"[technical] 网络补充 {len(missing_codes)} 只缺失股票…")
+        remote_map = get_stock_history_batch(missing_codes, days=history_days)
+        history_map.update(remote_map)
+
     for idx, code in enumerate(codes, 1):
         print(f"[technical] 处理 {code} ({idx}/{total})...", end="\r")
-        df = get_stock_history(code, days=history_days)
+        if progress_cb:
+            progress_cb(idx / total)
+        df = history_map.get(code, pd.DataFrame())
         if df.empty or len(df) < max(ma_periods) + 5:
             continue
 
@@ -316,7 +363,10 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
         if checks["weekly_ma_bullish"]:
             result["weekly_ma_bullish"] = _check_weekly_ma_bullish(df)
         if checks["macd_golden_cross"]:
-            result["macd_golden_cross"] = _check_macd_golden_cross(df, macd_fast, macd_slow, macd_signal_p)
+            result["macd_golden_cross"] = _check_macd_golden_cross(
+                df, macd_fast, macd_slow, macd_signal_p,
+                require_above_zero=False,  # 零轴条件由独立的 macd_above_zero 控制，避免双重计分
+            )
         if checks["macd_above_zero"]:
             result["macd_above_zero"] = _check_macd_above_zero(df, macd_fast, macd_slow, macd_signal_p)
         if checks["macd_hist_expand"]:
@@ -341,6 +391,7 @@ def screen(codes: list, params: dict = None) -> pd.DataFrame:
         row = {"code": code}
         row.update(result)
         row["signal_count"] = signal_count
+        row["vol_ratio"] = _calc_volume_ratio(df)
         records.append(row)
 
     print()  # 换行

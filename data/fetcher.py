@@ -1,7 +1,7 @@
 """
 data/fetcher.py
 A股实时行情、历史K线、北向资金数据获取模块
-依赖：akshare, pandas；可选：tushare, baostock
+依赖：baostock, pandas；可选：tushare, akshare
 
 支持多数据源切换，默认使用 AKShare（无需配置）。
 切换示例：
@@ -94,14 +94,8 @@ def get_stock_history(code: str, days: int = 120) -> pd.DataFrame:
 
     网络失败时返回空 DataFrame 并打印错误。
     当前数据源由 set_data_source() 控制，默认为 akshare。
-    AKShare 失败时自动回退至 Baostock。
     """
-    result = _get_source_module().get_stock_history(code, days, _SOURCE_CONFIG)
-    if result.empty and _SOURCE == "akshare":
-        print(f"[fetcher] AKShare 获取 {code} 失败，自动回退至 Baostock…")
-        from data.sources import baostock_source
-        result = baostock_source.get_stock_history(code, days, {})
-    return result
+    return _get_source_module().get_stock_history(code, days, _SOURCE_CONFIG)
 
 
 def get_northbound_flow() -> pd.DataFrame:
@@ -131,6 +125,24 @@ def get_northbound_holdings() -> pd.DataFrame:
     注意：tushare 数据源需要高级积分权限，将返回空 DataFrame。
     """
     return _get_source_module().get_northbound_holdings(_SOURCE_CONFIG)
+
+
+def get_stock_history_batch(codes: list, days: int = 120) -> dict:
+    """
+    批量获取多只股票历史K线（共享 baostock 会话，大幅减少网络握手次数）。
+
+    参数：
+        codes - 股票代码列表（6位字符串）
+        days  - 最近N个交易日
+
+    返回：{code: DataFrame} 字典，DataFrame 列与 get_stock_history 一致。
+    网络失败的个股值为空 DataFrame。
+    """
+    src = _get_source_module()
+    if hasattr(src, "get_stock_history_batch"):
+        return src.get_stock_history_batch(codes, days, _SOURCE_CONFIG)
+    # 不支持批量的数据源退化为逐条获取
+    return {code: src.get_stock_history(code, days, _SOURCE_CONFIG) for code in codes}
 
 
 if __name__ == "__main__":

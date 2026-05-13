@@ -48,14 +48,17 @@ def check_morning_star(df: pd.DataFrame) -> bool:
     if len(df) < 3:
         return False
     d1, d2, d3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    body1 = d1["open"] - d1["close"]     # 阴线实体
+    body1 = d1["open"] - d1["close"]     # 阴线实体（正值）
     body2 = abs(d2["close"] - d2["open"])
-    body3 = d3["close"] - d3["open"]     # 阳线实体
-    avg_price = df["close"].tail(20).mean() or 1
-    threshold = avg_price * 0.01
-    if body1 < threshold * 2 or body3 < threshold * 2:
+    body3 = d3["close"] - d3["open"]     # 阳线实体（正值）
+    range1 = d1["high"] - d1["low"]      # 第一根K线振幅
+    if range1 == 0 or body1 <= 0 or body3 <= 0:
         return False
-    if body2 > body1 * 0.3:
+    # 第一根须为大阴线：实体占振幅 >= 60%（A股标准）
+    if body1 / range1 < 0.6:
+        return False
+    # 星体须极小：实体不超过第一根振幅的 5%（避免假星）
+    if body2 / range1 > 0.05:
         return False
     mid1 = (d1["open"] + d1["close"]) / 2
     return d3["close"] > mid1
@@ -162,16 +165,20 @@ def check_double_bottom(df: pd.DataFrame) -> bool:
 
 def check_oversold_bounce(df: pd.DataFrame) -> bool:
     """超卖反弹：近期RSI曾低于30，且最近2日RSI持续回升。"""
-    if len(df) < 16:
+    if len(df) < 30:
         return False
     close = df["close"]
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = 100 - 100 / (1 + rs)
     r = rsi.iloc[-6:]
-    return bool(r.min() < 30 and rsi.iloc[-1] > rsi.iloc[-2])
+    return bool(
+        r.min() < 30
+        and rsi.iloc[-1] > rsi.iloc[-2]
+        and rsi.iloc[-2] > rsi.iloc[-3]
+    )
 
 
 def check_golden_cross_ma(df: pd.DataFrame) -> bool:
@@ -182,6 +189,141 @@ def check_golden_cross_ma(df: pd.DataFrame) -> bool:
     ma5  = close.rolling(5).mean()
     ma10 = close.rolling(10).mean()
     return bool(ma5.iloc[-2] < ma10.iloc[-2] and ma5.iloc[-1] > ma10.iloc[-1])
+
+
+def check_ma_bullish_arrangement(df: pd.DataFrame) -> bool:
+    """多头排列：MA5>MA10>MA20>MA60，均线多头发散，强势趋势确认。"""
+    if len(df) < 62:
+        return False
+    close = df["close"]
+    ma5  = close.rolling(5).mean().iloc[-1]
+    ma10 = close.rolling(10).mean().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma60 = close.rolling(60).mean().iloc[-1]
+    return bool(ma5 > ma10 > ma20 > ma60)
+
+
+def check_box_breakout(df: pd.DataFrame) -> bool:
+    """箱体突破：近40日整理区间振幅≤5%，今日放量（≥2倍均量）突破箱顶>3%。"""
+    if len(df) < 42:
+        return False
+    box = df.iloc[-41:-1]  # 前40根（不含今日）
+    box_hi = box["high"].max()
+    box_lo = box["low"].min()
+    if box_lo == 0:
+        return False
+    if (box_hi - box_lo) / box_lo > 0.05:
+        return False
+    today = df.iloc[-1]
+    if today["close"] <= box_hi * 1.03:
+        return False
+    avg_vol = box["volume"].mean()
+    if avg_vol == 0:
+        return False
+    return bool(today["volume"] >= avg_vol * 2)
+
+
+def check_ma_smooth_up(df: pd.DataFrame) -> bool:
+    """均线顺畅上行：近20日MA20线性拟合R²≥0.85且斜率为正，趋势平滑无扰动。"""
+    if len(df) < 40:
+        return False
+    close = df["close"]
+    ma20 = close.rolling(20).mean().dropna()
+    if len(ma20) < 20:
+        return False
+    y = ma20.values[-20:]
+    x = np.arange(len(y), dtype=float)
+    coeffs = np.polyfit(x, y, 1)
+    slope = coeffs[0]
+    if slope <= 0:
+        return False
+    y_hat = np.polyval(coeffs, x)
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    if ss_tot == 0:
+        return False
+    r2 = 1 - ss_res / ss_tot
+    return r2 >= 0.85
+
+
+def check_low_vol_pullback(df: pd.DataFrame) -> bool:
+    """缩量回调：10日内涨幅≥5%后回调未破MA5，今日量≤前5日峰量75%且低于前5日均量，回调≤8%。"""
+    if len(df) < 15:
+        return False
+    close  = df["close"].values
+    low    = df["low"].values
+    volume = df["volume"].values
+
+    ma5        = close[-5:].mean()
+    ma5_5d_ago = close[-10:-5].mean()
+
+    close_10d         = close[-10:]
+    highest_close_10d = close_10d.max()
+    prior5_vol        = volume[-6:-1]           # 前5日量（不含今日），捕捉近期峰量
+    peak_vol_prior5   = float(prior5_vol.max())
+    avg_vol_prior5    = float(prior5_vol.mean())
+
+    if ma5 == 0 or peak_vol_prior5 == 0 or avg_vol_prior5 == 0:
+        return False
+    if (highest_close_10d / close[-10] - 1) < 0.05:              # P1 前期涨幅≥5%
+        return False
+    if close[-1] >= highest_close_10d * 0.998:                    # C1 已有回落（0.2%即可）
+        return False
+    if close[-1] < ma5 * 0.995:                                   # C2 收盘未破MA5（0.5%缓冲）
+        return False
+    if low[-1] < ma5 * 0.99:                                      # C3 低点未破MA5（1%缓冲）
+        return False
+    if (highest_close_10d - close[-1]) / highest_close_10d > 0.08:  # C4 回调≤8%
+        return False
+    if volume[-1] > peak_vol_prior5 * 0.75:                       # V1 今日量≤前5日峰量75%
+        return False
+    if volume[-1] > avg_vol_prior5:                               # V2 今日量低于前5日均量
+        return False
+    if ma5 <= ma5_5d_ago:                                         # A1 MA5向上倾斜
+        return False
+    return True
+
+
+def check_arc_up(df: pd.DataFrame) -> bool:
+    """日K圆弧上行：近20日收盘二次拟合开口向上（a>0）且处于上升段，R²≥0.88，20日总涨幅≥8%，末端斜率≥均价0.5%/日。"""
+    if len(df) < 40:
+        return False
+    y = df["close"].values[-20:].astype(float)
+    if y[0] == 0 or np.isnan(y[0]):
+        return False
+    if y[-1] / y[0] - 1 < 0.08:          # 20日总涨幅须≥8%，排除微弱弧形
+        return False
+    x = np.arange(len(y), dtype=float)
+    coeffs = np.polyfit(x, y, 2)
+    a, b, _ = coeffs
+    if a <= 0:
+        return False
+    deriv_end = 2 * a * x[-1] + b
+    if deriv_end <= 0:                     # 末端导数≤0说明已过顶点、开始下行
+        return False
+    avg_price = float(np.mean(y))
+    if avg_price == 0 or deriv_end / avg_price < 0.005:   # 末端斜率须≥均价0.5%/日
+        return False
+    y_hat = np.polyval(coeffs, x)
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    if ss_tot == 0:
+        return False
+    r2 = 1 - ss_res / ss_tot
+    return r2 >= 0.88
+
+
+def check_close_above_ma5(df: pd.DataFrame) -> bool:
+    """近5日收盘价均在MA5之上：连续5日收盘 >= MA5，短线强势持续信号。"""
+    if len(df) < 10:
+        return False
+    close = df["close"]
+    ma5 = close.rolling(5).mean()
+    last5_close = close.iloc[-5:]
+    last5_ma5 = ma5.iloc[-5:]
+    if last5_ma5.isna().any():
+        return False
+    return bool((last5_close.values >= last5_ma5.values).all())
 
 
 # ── 形态目录（CATALOG） ───────────────────────────────────────────────────────
@@ -195,7 +337,13 @@ CATALOG = [
     {"id": "ma60_breakout",         "name": "突破60日线",   "desc": "收盘价从MA60下方向上穿越，中期趋势转强",          "fn": check_ma60_breakout},
     {"id": "volume_breakout",       "name": "放量突破",     "desc": "创20日新高且量能放大1.5倍，趋势启动信号",         "fn": check_volume_breakout},
     {"id": "low_vol_consolidation", "name": "缩量调整",     "desc": "价格横盘+量能持续萎缩，蓄力蓄势中",              "fn": check_low_vol_consolidation},
+    {"id": "low_vol_pullback",     "name": "缩量回调",     "desc": "涨后回调守住五日线，今日量缩至前5日峰量75%以下",   "fn": check_low_vol_pullback},
     {"id": "double_bottom",         "name": "双底形态",     "desc": "W型底部两低点相近，颈线突破确认反转",             "fn": check_double_bottom},
     {"id": "oversold_bounce",       "name": "超卖反弹",     "desc": "RSI<30后回升，超卖区域抄底反弹信号",             "fn": check_oversold_bounce},
     {"id": "golden_cross_ma",       "name": "均线金叉",     "desc": "MA5上穿MA10，短期趋势转多",                    "fn": check_golden_cross_ma},
+    {"id": "ma_bullish_arrangement", "name": "多头排列",     "desc": "MA5>MA10>MA20>MA60，均线多头发散，强趋势信号",   "fn": check_ma_bullish_arrangement},
+    {"id": "box_breakout",    "name": "箱体突破",     "desc": "近40日箱体整理后放量上破，突破幅度>3%确认趋势启动",  "fn": check_box_breakout},
+    {"id": "ma_smooth_up",    "name": "均线顺畅上行",  "desc": "MA20近20日线性拟合R²≥0.85+正斜率，趋势平滑无扰动",  "fn": check_ma_smooth_up},
+    {"id": "arc_up",          "name": "圆弧上行",     "desc": "近20日收盘二次拟合开口向上且仍在上升段，20日涨幅≥8%，末端斜率≥均价0.5%/日，R²≥0.88", "fn": check_arc_up},
+    {"id": "close_above_ma5", "name": "五日线上方",   "desc": "近5日收盘价均在MA5之上，短线强势持续信号",              "fn": check_close_above_ma5},
 ]

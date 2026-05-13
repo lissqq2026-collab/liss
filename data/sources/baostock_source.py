@@ -18,7 +18,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import pandas as pd
-from datetime import datetime, timedelta
 
 # Baostock 不支持实时行情和北向资金，直接复用 akshare_source
 from data.sources.akshare_source import (
@@ -30,6 +29,7 @@ from data.sources.akshare_source import (
 __all__ = [
     "get_all_a_stock_realtime",
     "get_stock_history",
+    "get_stock_history_batch",
     "get_northbound_flow",
     "get_northbound_holdings",
 ]
@@ -38,80 +38,13 @@ __all__ = [
 def get_stock_history(code: str, days: int = 120, config: dict = None) -> pd.DataFrame:
     """
     使用 Baostock 获取指定股票的日线历史K线数据（前复权）。
-
-    参数：
-        code   - 股票代码（6位纯数字字符串，如 "000001"）
-        days   - 获取最近N个交易日数据，默认120天
-        config - Baostock 无需配置，忽略
-
-    返回 DataFrame 列：
-        date(datetime), open, high, low, close, volume, amount, pct_change
-    按日期升序排列。
-
-    失败时返回空 DataFrame。
+    返回 DataFrame 列：date(datetime), open, high, low, close, volume, amount, pct_change
     """
-    import baostock as bs
+    from data.sources._baostock_utils import bs_get_stock_history
+    return bs_get_stock_history(code, days, caller="baostock_source")
 
-    try:
-        bs.login()
 
-        # 代码格式：sh.600519 或 sz.000001
-        prefix = "sh" if code.startswith("6") else "sz"
-        bs_code = f"{prefix}.{code}"
-
-        end_date = datetime.today().strftime("%Y-%m-%d")
-        start_date = (datetime.today() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
-
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount,pctChg",
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",   # 2 = 前复权
-        )
-
-        if rs.error_code != "0":
-            print(f"[baostock_source] query_history_k_data_plus 错误: "
-                  f"code={rs.error_code}, msg={rs.error_msg}")
-            return pd.DataFrame()
-
-        data_list = []
-        while rs.error_code == "0" and rs.next():
-            data_list.append(rs.get_row_data())
-
-        if not data_list:
-            print(f"[baostock_source] get_stock_history({code}) 无数据")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data_list, columns=rs.fields)
-
-        # 统一列名
-        df = df.rename(columns={"pctChg": "pct_change"})
-
-        # 类型转换
-        df["date"] = pd.to_datetime(df["date"])
-        numeric_cols = ["open", "high", "low", "close", "volume", "amount", "pct_change"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        keep_cols = [c for c in
-                     ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
-                     if c in df.columns]
-        df = df[keep_cols].copy()
-
-        df = df.sort_values("date").reset_index(drop=True)
-        df = df.tail(days).reset_index(drop=True)
-
-        return df
-
-    except Exception as e:
-        print(f"[baostock_source] get_stock_history({code}) 失败: {e}")
-        return pd.DataFrame()
-
-    finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+def get_stock_history_batch(codes: list, days: int = 120, config: dict = None) -> dict:
+    """批量获取历史K线，共享 baostock 会话。"""
+    from data.sources._baostock_utils import bs_batch_get_stock_history
+    return bs_batch_get_stock_history(codes, days, caller="baostock_source")
