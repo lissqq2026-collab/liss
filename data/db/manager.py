@@ -28,6 +28,9 @@ def init_db() -> None:
         conn.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA cache_size = -65536;
+            PRAGMA wal_autocheckpoint = 4096;
             CREATE TABLE IF NOT EXISTS daily_kline (
                 code       TEXT NOT NULL,
                 date       TEXT NOT NULL,
@@ -45,8 +48,6 @@ def init_db() -> None:
                 name      TEXT,
                 last_date TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_dk_code ON daily_kline(code);
-            CREATE INDEX IF NOT EXISTS idx_dk_date ON daily_kline(date);
             CREATE TABLE IF NOT EXISTS watchlist (
                 code      TEXT NOT NULL,
                 name      TEXT,
@@ -55,6 +56,8 @@ def init_db() -> None:
                 PRIMARY KEY (code)
             );
         """)
+        conn.execute("DROP INDEX IF EXISTS idx_dk_code")
+        conn.execute("DROP INDEX IF EXISTS idx_dk_date")
 
 
 def upsert_daily(code: str, df: pd.DataFrame) -> None:
@@ -122,6 +125,32 @@ def upsert_meta(code: str, name: str, last_date: str) -> None:
         )
 
 
+def sync_meta_batch(stocks: list) -> None:
+    """Phase 1 专用：插入新股票，更新已有股票名称，保留已有 last_date。"""
+    if not stocks:
+        return
+    with _conn() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO stock_meta (code,name,last_date) VALUES (?,?,?)",
+            [(s["code"], s.get("name", ""), "") for s in stocks],
+        )
+        conn.executemany(
+            "UPDATE stock_meta SET name=? WHERE code=? AND name!=?",
+            [(s.get("name", ""), s["code"], s.get("name", "")) for s in stocks],
+        )
+
+
+def upsert_meta_batch(stocks: list) -> None:
+    """批量写入 stock_meta，包含 last_date 全覆盖。stock 格式: [{"code":..., "name":..., "last_date":...}, ...]"""
+    if not stocks:
+        return
+    with _conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO stock_meta (code,name,last_date) VALUES (?,?,?)",
+            [(s["code"], s.get("name", ""), s.get("last_date", "")) for s in stocks],
+        )
+
+
 def get_meta(code: str) -> dict:
     with _conn() as conn:
         cur = conn.execute("SELECT code,name,last_date FROM stock_meta WHERE code=?", (code,))
@@ -137,6 +166,13 @@ def get_all_codes() -> list:
         cur = conn.execute("SELECT code,name FROM stock_meta ORDER BY code")
         rows = cur.fetchall()
     return [{"code": r[0], "name": r[1]} for r in rows]
+
+
+def get_all_metas() -> dict:
+    """一次性返回 {code: {"name":..., "last_date":...}} 所有股票元信息。"""
+    with _conn() as conn:
+        cur = conn.execute("SELECT code,name,last_date FROM stock_meta")
+        return {r[0]: {"name": r[1], "last_date": r[2]} for r in cur.fetchall()}
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +272,52 @@ def get_daily_count(code: str) -> int:
         )
         row = cur.fetchone()
     return int(row[0]) if row else 0
+
+
+def get_all_daily_counts() -> dict:
+    """一次性返回 {code: count} 所有股票的K线记录数，避免逐只 COUNT 查询。"""
+    with _conn() as conn:
+        cur = conn.execute("SELECT code, COUNT(*) FROM daily_kline GROUP BY code")
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def upsert_daily_batch(records: list) -> None:
+    """批量写入多条 (code, df) 记录，单连接单事务，远快于逐只 upsert_daily。"""
+    if not records:
+        return
+    rows = []
+    for code, df in records:
+        if df.empty:
+            continue
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"]).dt.strftime("%Y-%m-%d")
+        for col in ["open", "high", "low", "close", "volume", "amount", "pct_change"]:
+            if col not in tmp.columns:
+                tmp[col] = None
+        for _, row in tmp.iterrows():
+            rows.append((
+                code,
+                row["date"],
+                _safe(row, "open"), _safe(row, "high"), _safe(row, "low"), _safe(row, "close"),
+                _safe(row, "volume"), _safe(row, "amount"), _safe(row, "pct_change"),
+            ))
+    if not rows:
+        return
+    with _conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily_kline "
+            "(code,date,open,high,low,close,volume,amount,pct_change) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def vacuum_db() -> None:
+    """WAL checkpoint + optimize + VACUUM，后台维护用。"""
+    with _conn() as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA optimize")
+        conn.execute("VACUUM")
 
 
 # 模块加载时统一执行一次数据库初始化

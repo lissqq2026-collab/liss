@@ -108,14 +108,14 @@ def screen(params: dict = None, progress_cb=None) -> tuple:
     snapshot = get_northbound_holdings()
     if snapshot.empty:
         print("[capital_flow] 持股快照为空，退出")
-        return pd.DataFrame()
+        return pd.DataFrame(), {"api_fail_count": 0, "total_candidates": 0, "timeout_count": 0}
 
     # 只保留指定市场
     if "market" in snapshot.columns:
         snapshot = snapshot[snapshot["market"].isin(markets)]
 
     if snapshot.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), {"api_fail_count": 0, "total_candidates": 0, "timeout_count": 0}
 
     print(f"[capital_flow] 快照共 {len(snapshot)} 条，开始预筛选...")
 
@@ -127,7 +127,7 @@ def screen(params: dict = None, progress_cb=None) -> tuple:
         candidates = snapshot.copy()
 
     if candidates.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), {"api_fail_count": 0, "total_candidates": 0, "timeout_count": 0}
 
     records = []
     total = len(candidates)

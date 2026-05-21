@@ -13,36 +13,32 @@ import plotly.graph_objects as go
 
 st.set_page_config(layout="wide", page_title="相似选股")
 
-
-# ── 缓存包装 ──────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=300)
-def _cached_get_all_codes():
-    from data.db import manager as db
-    return db.get_all_codes()
+from ui.common import inject_compact_css, empty_state, cached_get_all_codes
+inject_compact_css()
 
 
 # ── 日期默认值 ────────────────────────────────────────────────────────────────
 
 today = datetime.date.today()
-default_start = today - datetime.timedelta(days=30)
+default_start = today - datetime.timedelta(days=60)
 
 
 # ── 侧边栏 ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("🔍 相似选股")
+    st.markdown("### 🔍 相似选股")
     st.markdown("---")
 
     # 股票代码列表
-    all_codes_meta = _cached_get_all_codes()
+    all_codes_meta = cached_get_all_codes()
     if all_codes_meta:
         code_options = [f"{item['code']} - {item['name']}" for item in all_codes_meta]
     else:
         code_options = []
 
     # 模板股票选择
-    st.markdown("#### 模板股票")
+    st.markdown("**模板股票**")
+    st.caption("建议覆盖 30–60 个交易日以保证匹配稳定")
     template_option = st.selectbox(
         "选择模板股票",
         options=code_options if code_options else ["（数据库为空）"],
@@ -53,7 +49,7 @@ with st.sidebar:
     )
 
     # 模板区间
-    st.markdown("#### 模板区间")
+    st.markdown("**模板区间**")
     col_date1, col_date2 = st.columns(2)
     with col_date1:
         date_start = st.date_input(
@@ -73,7 +69,7 @@ with st.sidebar:
     st.markdown("---")
 
     # 相似度阈值
-    st.markdown("#### 匹配参数")
+    st.markdown("**匹配参数**")
     min_similarity = st.slider(
         "相似度阈值",
         min_value=0.50,
@@ -112,26 +108,18 @@ with st.sidebar:
 st.title("相似K线选股")
 
 if not search_btn:
-    # 未点击时显示使用说明
-    with st.container(border=True):
+    empty_state(
+        "🔍",
+        "相似K线选股",
+        "在左侧选择模板股票与特征区间，扫描全市场找出走势最相似的股票。",
+        hint="💡 需先在「K线查看」页面完成批量下载，才能使用本功能",
+    )
+    with st.expander("算法说明", expanded=False):
         st.markdown(
-            """
-            <div style="text-align: center; padding: 2rem 1rem;">
-                <div style="font-size: 4rem; margin-bottom: 1rem;">🔍</div>
-                <h3 style="margin-bottom: 0.5rem; color: #374151;">相似K线选股</h3>
-                <p style="color: #6B7280; font-size: 0.95rem; line-height: 1.8;">
-                    在左侧选择一只<strong>模板股票</strong>及其<strong>特征区间</strong>，系统将自动扫描全市场，
-                    找出近期走势与模板K线最相似的股票组合。<br>
-                    相似度基于价格归一化收益率（权重70%）与量能相对均量（权重30%）的 Pearson 相关系数综合计算，
-                    适合捕捉处于相同趋势阶段、潜在共振机会的同步票。<br>
-                    调整<strong>相似度阈值</strong>控制筛选严格程度，点击「开始相似匹配」后系统将扫描全库并展示匹配结果。
-                </p>
-                <p style="color: #9CA3AF; font-size: 0.85rem; margin-top: 1rem;">
-                    💡 需先在「K线查看」页面完成批量下载，才能使用本功能
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+            "- **价格相似度（权重 70%）**：归一化收益率序列的 Pearson 相关系数\n"
+            "- **量能相似度（权重 30%）**：相对均量序列的 Pearson 相关系数\n"
+            "- 适合捕捉处于相同趋势阶段、潜在共振机会的同步票\n"
+            "- 提高**相似度阈值**可让筛选更严格"
         )
     st.stop()
 
@@ -172,7 +160,7 @@ fig_tmpl = build_kline_chart(
     show_macd=False,
     show_ma_periods=[5, 10, 20],
 )
-st.plotly_chart(fig_tmpl, use_container_width=True, config={
+st.plotly_chart(fig_tmpl, use_container_width=True, key="sim_tmpl", config={
     "scrollZoom": True,
     "displayModeBar": True,
 })
@@ -183,6 +171,7 @@ st.markdown("### 相似匹配结果")
 # 执行匹配
 from strategies.similarity import find_similar_stocks
 
+st.caption("通常需 10–60 秒，取决于本地股票池大小")
 with st.spinner("正在匹配全市场K线，请稍候…"):
     results = find_similar_stocks(
         template_code=template_code,
@@ -206,111 +195,137 @@ if not results:
 
 st.success(f"共找到 {len(results)} 只相似股票（相似度阈值：{min_similarity:.0%}）")
 
-# ── 逐条展示结果 ──────────────────────────────────────────────────────────────
+# ── 结果展示：叠加对比 + 逐条详情 ────────────────────────────────────────────
 
-for rank, result in enumerate(results, start=1):
-    code     = result["code"]
-    name     = result["name"]
-    sim      = result["similarity"]
-    price_s  = result["price_sim"]
-    vol_s    = result["vol_sim"]
-    df_cand  = result["df_candidate"]
-    tmpl_norm = result["template_norm"]
-    cand_norm = result["candidate_norm"]
+tab_overlay, tab_detail = st.tabs(["📊 叠加对比", "📋 逐条详情"])
 
-    st.markdown(f"## {rank}. {name}（{code}） — 相似度 {sim:.1%}")
-
-    # 两列布局：左-归一化走势对比，右-候选K线图
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        # 归一化走势对比图
-        indices = list(range(1, len(tmpl_norm) + 1))
-        fig_norm = go.Figure()
-        fig_norm.add_trace(go.Scatter(
+with tab_overlay:
+    # 全部候选归一化曲线 + 模板叠加于一张图
+    indices = list(range(1, len(results[0]["template_norm"]) + 1))
+    fig_all = go.Figure()
+    fig_all.add_trace(go.Scatter(
+        x=indices,
+        y=results[0]["template_norm"],
+        name=f"模板({template_code})",
+        line=dict(color="#FF3333", width=3),
+    ))
+    _palette = ["#1E90FF", "#FF8C00", "#9C27B0", "#00B894", "#E84393",
+                "#0984E3", "#FDCB6E", "#6C5CE7", "#00CEC9", "#D63031"]
+    for i, result in enumerate(results):
+        fig_all.add_trace(go.Scatter(
             x=indices,
-            y=tmpl_norm,
-            name=f"模板({template_code})",
-            line=dict(color="#FF3333", width=2),
+            y=result["candidate_norm"],
+            name=f"{result['name']}({result['code']}) {result['similarity']:.0%}",
+            line=dict(color=_palette[i % len(_palette)], width=1.5),
         ))
-        fig_norm.add_trace(go.Scatter(
-            x=indices,
-            y=cand_norm,
-            name=f"{name}({code})",
-            line=dict(color="#1E90FF", width=2),
-        ))
-        fig_norm.update_layout(
-            title="归一化走势对比",
-            xaxis_title="K线序号",
-            yaxis_title="累计收益率",
-            height=300,
-            margin=dict(t=40, b=20),
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        st.plotly_chart(fig_norm, use_container_width=True)
+    fig_all.update_layout(
+        title="全部候选 vs 模板 — 归一化累计收益率",
+        xaxis_title="K线序号",
+        yaxis_title="累计收益率",
+        height=480,
+        margin=dict(t=50, b=20),
+        template="plotly_white",
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.01),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_all, use_container_width=True, key="sim_overlay")
+    st.caption("模板（红，加粗）与各候选股归一化走势叠加，曲线越贴合越相似。")
 
-    with col_right:
-        # 候选股K线图
-        fig_cand = build_kline_chart(
-            df_cand,
-            title=f"{code}  {name}  最近{len(df_cand)}根K线",
-            show_macd=False,
-            show_ma_periods=[5, 10, 20],
-        )
-        # 调小高度以适应并列布局
-        fig_cand.update_layout(height=300, margin=dict(t=40, b=20, l=50, r=10))
-        st.plotly_chart(fig_cand, use_container_width=True)
+with tab_detail:
+    for rank, result in enumerate(results, start=1):
+        code     = result["code"]
+        name     = result["name"]
+        sim      = result["similarity"]
+        price_s  = result["price_sim"]
+        vol_s    = result["vol_sim"]
+        df_cand  = result["df_candidate"]
+        tmpl_norm = result["template_norm"]
+        cand_norm = result["candidate_norm"]
 
-    # 指标行（3列）
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    with metric_col1:
-        st.metric(
-            label="价格相似度",
-            value=f"{price_s:.1%}",
-            help="价格归一化序列的 Pearson 相关系数",
-        )
-    with metric_col2:
-        if vol_s == -1.0:
-            st.metric(
-                label="量能相似度",
-                value="量能数据不足",
-                help="量能数据缺失或无效，综合相似度仅基于价格维度计算",
-            )
-        else:
-            st.metric(
-                label="量能相似度",
-                value=f"{vol_s:.1%}",
-                help="量能归一化序列的 Pearson 相关系数",
-            )
-    with metric_col3:
-        st.metric(
-            label="模板区间",
-            value=f"{date_start} ~ {date_end}",
-            help="模板K线所对应的日期区间",
-        )
+        with st.expander(f"{rank}. {name}（{code}） — 相似度 {sim:.1%}", expanded=(rank == 1)):
+            # 两列布局：左-归一化走势对比，右-候选K线图
+            col_left, col_right = st.columns(2)
 
-    # 加入自选股按钮
-    already_in = db.is_in_watchlist(code)
-    if already_in:
-        st.button(
-            f"✅ 已在自选股",
-            key=f"watchlist_{code}",
-            disabled=True,
-            use_container_width=False,
-        )
-    else:
-        if st.button(
-            f"⭐ 加入自选股  {code} {name}",
-            key=f"watchlist_{code}",
-            type="primary",
-            use_container_width=False,
-        ):
-            success = db.add_to_watchlist(code, name)
-            if success:
-                st.toast(f"已加入自选股：{code} {name}", icon="⭐")
-                st.rerun()
+            with col_left:
+                # 归一化走势对比图
+                indices = list(range(1, len(tmpl_norm) + 1))
+                fig_norm = go.Figure()
+                fig_norm.add_trace(go.Scatter(
+                    x=indices,
+                    y=tmpl_norm,
+                    name=f"模板({template_code})",
+                    line=dict(color="#FF3333", width=2),
+                ))
+                fig_norm.add_trace(go.Scatter(
+                    x=indices,
+                    y=cand_norm,
+                    name=f"{name}({code})",
+                    line=dict(color="#1E90FF", width=2),
+                ))
+                fig_norm.update_layout(
+                    title="归一化走势对比",
+                    xaxis_title="K线序号",
+                    yaxis_title="累计收益率",
+                    height=300,
+                    margin=dict(t=40, b=20),
+                    template="plotly_white",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_norm, use_container_width=True, key=f"norm_{code}")
+
+            with col_right:
+                # 候选股K线图
+                fig_cand = build_kline_chart(
+                    df_cand,
+                    title=f"{code}  {name}  最近{len(df_cand)}根K线",
+                    show_macd=False,
+                    show_ma_periods=[5, 10, 20],
+                )
+                # 调小高度以适应并列布局
+                fig_cand.update_layout(height=300, margin=dict(t=40, b=20, l=50, r=10))
+                st.plotly_chart(fig_cand, use_container_width=True, key=f"cand_{code}")
+
+            # 指标行（2列）
+            metric_col1, metric_col2 = st.columns(2)
+            with metric_col1:
+                st.metric(
+                    label="价格相似度",
+                    value=f"{price_s:.1%}",
+                    help="价格归一化序列的 Pearson 相关系数",
+                )
+            with metric_col2:
+                if vol_s == -1.0:
+                    st.metric(
+                        label="量能相似度",
+                        value="量能数据不足",
+                        help="量能数据缺失或无效，综合相似度仅基于价格维度计算",
+                    )
+                else:
+                    st.metric(
+                        label="量能相似度",
+                        value=f"{vol_s:.1%}",
+                        help="量能归一化序列的 Pearson 相关系数",
+                    )
+
+            # 加入自选股按钮
+            already_in = db.is_in_watchlist(code)
+            if already_in:
+                st.button(
+                    f"✅ 已在自选股",
+                    key=f"watchlist_{code}",
+                    disabled=True,
+                    use_container_width=False,
+                )
             else:
-                st.toast(f"加入失败，请稍后重试", icon="❌")
-
-    st.markdown("---")
+                if st.button(
+                    f"⭐ 加入自选股  {code} {name}",
+                    key=f"watchlist_{code}",
+                    type="primary",
+                    use_container_width=False,
+                ):
+                    success = db.add_to_watchlist(code, name)
+                    if success:
+                        st.toast(f"已加入自选股：{code} {name}", icon="⭐")
+                        st.rerun()
+                    else:
+                        st.toast(f"加入失败，请稍后重试", icon="❌")

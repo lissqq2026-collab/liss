@@ -5,3 +5,6 @@ streamlit
 tushare
 baostock
 plotly
+streamlit-searchbox
+pypinyin
+chinese_calendar

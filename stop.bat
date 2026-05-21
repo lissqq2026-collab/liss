@@ -1,3 +1,3 @@
 @echo off
 cd /d %~dp0
-python restart.py
+python stop.py
